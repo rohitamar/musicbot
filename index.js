@@ -1,8 +1,5 @@
 require("dotenv").config();
 
-const path = require("node:path");
-const fs = require("node:fs");
-
 const { Client, GatewayIntentBits } = require("discord.js");
 const {
     joinVoiceChannel,
@@ -13,17 +10,110 @@ const {
     entersState,
     generateDependencyReport,
 } = require("@discordjs/voice");
+const {
+    deleteSlotAudio,
+    getAudioPath,
+    saveAttachmentToSlot,
+} = require("./audioStorage");
 
 console.log(generateDependencyReport());
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
         GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.MessageContent,
     ],
 });
 
 const recentlyPlayed = new Set();
+const helpMessage = () =>
+    [
+        "Commands:",
+        `\`<@Dihtator> help\` shows this message.`,
+        `\`<@Dihtator> upload join\` uploads the default join sound from one attached audio file.`,
+        `\`<@Dihtator> upload leave\` uploads the default leave sound from one attached audio file.`,
+        `\`<@Dihtator> upload join @user\` uploads a custom join sound for that user.`,
+        `\`<@Dihtator> upload leave @user\` uploads a custom leave sound for that user.`,
+        `\`<@Dihtator> delete join\` removes the default join sound.`,
+        `\`<@Dihtator> delete leave\` removes the default leave sound.`,
+        `\`<@Dihtator> delete join @user\` removes that user's custom join sound.`,
+        `\`<@Dihtator> delete leave @user\` removes that user's custom leave sound.`
+    ].join("\n");
+
+function getTargetUser(message, botUserId) {
+    const targetUsers = message.mentions.users.filter((user) => user.id !== botUserId);
+
+    if (targetUsers.size > 1) {
+        throw new Error("Mention only one target user per command.");
+    }
+
+    const targetUser = targetUsers.first();
+    if (targetUser && targetUser.bot) {
+        throw new Error("Custom audio can only be assigned to human users.");
+    }
+
+    return targetUser || null;
+}
+
+function getAudioTargetLabel(slotName, targetUser) {
+    if (!targetUser) {
+        return `the default ${slotName} audio`;
+    }
+
+    return `${targetUser.username}'s ${slotName} audio`;
+}
+
+client.on("messageCreate", async (message) => {
+    if (!client.user || !message.inGuild() || message.author.bot) return;
+    if (!message.mentions.has(client.user)) return;
+
+    const commandText = message.content
+        .replace(new RegExp(`<@!?${client.user.id}>`, "g"), "")
+        .trim()
+        .toLowerCase();
+
+    if (!commandText || ["help", "commands"].includes(commandText)) {
+        await message.reply(helpMessage(client.user.id));
+        return;
+    }
+
+    const [command, slotName] = commandText.split(/\s+/);
+    if (!["upload", "delete"].includes(command) || !["join", "leave"].includes(slotName)) {
+        await message.reply(helpMessage(client.user.id));
+        return;
+    }
+
+    try {
+        const targetUser = getTargetUser(message, client.user.id);
+        const targetUserId = targetUser ? targetUser.id : undefined;
+        const audioTargetLabel = getAudioTargetLabel(slotName, targetUser);
+
+        if (command === "upload") {
+            const [attachment] = message.attachments.values();
+            if (!attachment) {
+                await message.reply("Attach one audio file with the upload command.");
+                return;
+            }
+
+            await saveAttachmentToSlot(slotName, attachment, targetUserId);
+            await message.reply(`Updated ${audioTargetLabel}.`);
+            return;
+        }
+
+        const removedCount = await deleteSlotAudio(slotName, targetUserId);
+        if (removedCount === 0) {
+            await message.reply(`There is no ${audioTargetLabel} to delete.`);
+            return;
+        }
+
+        await message.reply(`Deleted ${audioTargetLabel}.`);
+    } catch (error) {
+        console.error(`Failed to ${command} ${slotName} audio:`, error);
+        await message.reply(error.message || `${command} failed.`);
+    }
+});
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
     const member = newState.member;
@@ -48,11 +138,11 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         if (!hasHumanListeners) return;
     }
 
-    const fileName = joinedVoiceChannel ? "picolo.mp3" : "leave.mp3";
-    const audioPath = path.join(__dirname, fileName);
+    const slotName = joinedVoiceChannel ? "join" : "leave";
+    const audioPath = getAudioPath(slotName, member.id);
 
-    if (!fs.existsSync(audioPath)) {
-        console.error(`${fileName} not found`);
+    if (!audioPath) {
+        console.error(`${slotName} audio not found in assets/`);
         return;
     }
 
@@ -82,7 +172,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const resource = createAudioResource(audioPath, {
         inlineVolume: true,
     });
-    resource.volume.setVolume(0.05);
+    resource.volume.setVolume(0.8);
 
     connection.subscribe(player);
     player.play(resource);
