@@ -28,7 +28,10 @@ const client = new Client({
     ],
 });
 
-console.log(process.env.DISCORD_TOKEN?.length);
+console.log(
+  "Discord env keys:",
+  Object.keys(process.env).filter((key) => key.includes("DISCORD"))
+);
 const PLAYBACK_DEBOUNCE_MS = 30_000;
 const recentlyPlayedGuilds = new Set();
 const helpMessage = (botUserId) =>
