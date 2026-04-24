@@ -27,10 +27,7 @@ const client = new Client({
     ],
 });
 
-console.log(
-  "Discord env keys:",
-  Object.keys(process.env).filter((key) => key.includes("DISCORD"))
-);
+console.log("process.env.TEST:", process.env.TEST);
 const PLAYBACK_DEBOUNCE_MS = 30_000;
 const recentlyPlayedGuilds = new Set();
 const helpMessage = (botUserId) =>
