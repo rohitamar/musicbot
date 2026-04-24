@@ -11,6 +11,7 @@ const {
     generateDependencyReport,
 } = require("@discordjs/voice");
 const {
+    MAX_UPLOAD_SIZE_BYTES,
     deleteSlotAudio,
     getAudioPath,
     saveAttachmentToSlot,
@@ -27,22 +28,28 @@ const client = new Client({
     ],
 });
 
-const recentlyPlayed = new Set();
-const helpMessage = () =>
+const PLAYBACK_DEBOUNCE_MS = 30_000;
+const recentlyPlayedGuilds = new Set();
+const helpMessage = (botUserId) =>
     [
         "Commands:",
-        `\`<@Dihtator> help\` shows this message.`,
-        `\`<@Dihtator> upload join\` uploads the default join sound from one attached audio file.`,
-        `\`<@Dihtator> upload leave\` uploads the default leave sound from one attached audio file.`,
-        `\`<@Dihtator> upload join @user\` uploads a custom join sound for that user.`,
-        `\`<@Dihtator> upload leave @user\` uploads a custom leave sound for that user.`,
-        `\`<@Dihtator> delete join\` removes the default join sound.`,
-        `\`<@Dihtator> delete leave\` removes the default leave sound.`,
-        `\`<@Dihtator> delete join @user\` removes that user's custom join sound.`,
-        `\`<@Dihtator> delete leave @user\` removes that user's custom leave sound.`
+        `\`<@${botUserId}> help\` shows this message.`,
+        `\`<@${botUserId}> upload join\` uploads your join sound from one attached audio file.`,
+        `\`<@${botUserId}> upload leave\` uploads your leave sound from one attached audio file.`,
+        `\`<@${botUserId}> upload join @user\` uploads a custom join sound for that user.`,
+        `\`<@${botUserId}> upload leave @user\` uploads a custom leave sound for that user.`,
+        `\`<@${botUserId}> upload default join\` uploads the default join fallback sound.`,
+        `\`<@${botUserId}> upload default leave\` uploads the default leave fallback sound.`,
+        `\`<@${botUserId}> delete join\` removes your current join sound.`,
+        `\`<@${botUserId}> delete leave\` removes your current leave sound.`,
+        `\`<@${botUserId}> delete join @user\` removes that user's custom join sound.`,
+        `\`<@${botUserId}> delete leave @user\` removes that user's custom leave sound.`,
+        `\`<@${botUserId}> delete default join\` removes the default join fallback sound.`,
+        `\`<@${botUserId}> delete default leave\` removes the default leave fallback sound.`,
+        `Supported formats: mp3, wav, ogg, m4a, aac, flac. Max size: ${Math.floor(MAX_UPLOAD_SIZE_BYTES / (1024 * 1024))} MB.`,
     ].join("\n");
 
-function getTargetUser(message, botUserId) {
+function getMentionedTargetUser(message, botUserId) {
     const targetUsers = message.mentions.users.filter((user) => user.id !== botUserId);
 
     if (targetUsers.size > 1) {
@@ -57,9 +64,44 @@ function getTargetUser(message, botUserId) {
     return targetUser || null;
 }
 
-function getAudioTargetLabel(slotName, targetUser) {
-    if (!targetUser) {
+function parseCommand(commandText) {
+    const parts = commandText.split(/\s+/).filter(Boolean);
+    const [command, scopeOrSlot, slotMaybe] = parts;
+
+    if (!["upload", "delete"].includes(command)) {
+        return null;
+    }
+
+    if (scopeOrSlot === "default") {
+        if (!["join", "leave"].includes(slotMaybe)) {
+            return null;
+        }
+
+        return {
+            command,
+            isDefaultScope: true,
+            slotName: slotMaybe,
+        };
+    }
+
+    if (!["join", "leave"].includes(scopeOrSlot)) {
+        return null;
+    }
+
+    return {
+        command,
+        isDefaultScope: false,
+        slotName: scopeOrSlot,
+    };
+}
+
+function getAudioTargetLabel(slotName, targetUser, author, isDefaultScope) {
+    if (isDefaultScope) {
         return `the default ${slotName} audio`;
+    }
+
+    if (targetUser.id === author.id) {
+        return `your ${slotName} audio`;
     }
 
     return `${targetUser.username}'s ${slotName} audio`;
@@ -79,16 +121,31 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    const [command, slotName] = commandText.split(/\s+/);
-    if (!["upload", "delete"].includes(command) || !["join", "leave"].includes(slotName)) {
+    const parsedCommand = parseCommand(commandText);
+    if (!parsedCommand) {
         await message.reply(helpMessage(client.user.id));
         return;
     }
 
     try {
-        const targetUser = getTargetUser(message, client.user.id);
+        const mentionedTargetUser = getMentionedTargetUser(message, client.user.id);
+        const { command, isDefaultScope, slotName } = parsedCommand;
+
+        if (isDefaultScope && mentionedTargetUser) {
+            await message.reply("Do not mention a user when using the default audio commands.");
+            return;
+        }
+
+        const targetUser = isDefaultScope
+            ? null
+            : mentionedTargetUser || message.author;
         const targetUserId = targetUser ? targetUser.id : undefined;
-        const audioTargetLabel = getAudioTargetLabel(slotName, targetUser);
+        const audioTargetLabel = getAudioTargetLabel(
+            slotName,
+            targetUser,
+            message.author,
+            isDefaultScope
+        );
 
         if (command === "upload") {
             const [attachment] = message.attachments.values();
@@ -124,12 +181,11 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 
     if (!joinedVoiceChannel && !leftVoiceChannel) return;
 
-    const eventType = joinedVoiceChannel ? "join" : "leave";
-    const key = `${member.guild.id}:${member.id}:${eventType}`;
-    if (recentlyPlayed.has(key)) return;
+    const key = member.guild.id;
+    if (recentlyPlayedGuilds.has(key)) return;
 
-    recentlyPlayed.add(key);
-    setTimeout(() => recentlyPlayed.delete(key), 5_000);
+    recentlyPlayedGuilds.add(key);
+    setTimeout(() => recentlyPlayedGuilds.delete(key), PLAYBACK_DEBOUNCE_MS);
 
     const channel = joinedVoiceChannel ? newState.channel : oldState.channel;
 
@@ -172,7 +228,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const resource = createAudioResource(audioPath, {
         inlineVolume: true,
     });
-    resource.volume.setVolume(0.8);
+    resource.volume.setVolume(0.4);
 
     connection.subscribe(player);
     player.play(resource);
