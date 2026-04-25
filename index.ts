@@ -323,9 +323,9 @@ function drainAudioQueue(session: GuildVoiceSession): void {
         inlineVolume: true,
         inputType: StreamType.Raw,
     });
-    resource.volume?.setVolume(0.4);
+    resource.volume?.setVolume(0.3);
 
-    playbackLogger.info({ volume: 0.4, maxSeconds: MAX_AUDIO_PLAYBACK_SECONDS }, "Starting audio playback");
+    playbackLogger.info({ volume: 0.3, maxSeconds: MAX_AUDIO_PLAYBACK_SECONDS }, "Starting audio playback");
     session.player.play(resource);
 }
 
