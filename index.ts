@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import * as path from "node:path";
 import type { Readable } from "node:stream";
 
 import {
@@ -76,7 +77,7 @@ type GuildVoiceSession = {
 };
 
 const guildVoiceSessions = new Map<string, GuildVoiceSession>();
-const MAX_AUDIO_PLAYBACK_SECONDS = 5;
+const MAX_AUDIO_PLAYBACK_SECONDS = 8;
 const USER_AUDIO_RATE_LIMIT_MS = 60_000;
 const recentUserAudioPlaybackAt = new Map<string, number>();
 
@@ -221,8 +222,12 @@ function getMissingVoicePermissions(channel: VoiceBasedChannel): string[] {
         .map(({ name }) => name);
 }
 
-function getUserPlaybackRateLimitKey(guildId: string, userId: string): string {
-    return `${guildId}:${userId}`;
+function getUserPlaybackRateLimitKey(
+    guildId: string,
+    userId: string,
+    slotName: AudioSlotName
+): string {
+    return `${guildId}:${userId}:${slotName}`;
 }
 
 function destroyVoiceSession(guildId: string, reason: string): void {
@@ -456,7 +461,7 @@ async function enqueueVoiceEventAudio(
     voiceLogger: typeof botLogger,
     shouldCreateSession: boolean
 ): Promise<void> {
-    const rateLimitKey = getUserPlaybackRateLimitKey(channel.guild.id, userId);
+    const rateLimitKey = getUserPlaybackRateLimitKey(channel.guild.id, userId, slotName);
     const lastPlaybackAt = recentUserAudioPlaybackAt.get(rateLimitKey);
     const now = Date.now();
     const audioPath = getAudioPath(slotName, userId);
@@ -629,15 +634,17 @@ client.on("messageCreate", async (message) => {
                 return;
             }
 
-            await saveAttachmentToSlot(slotName, attachment, targetUserId);
+            const savedAudioPath = await saveAttachmentToSlot(slotName, attachment, targetUserId);
+            const savedFileName = path.basename(savedAudioPath);
             targetLogger.info(
                 {
                     attachmentName: attachment.name,
                     attachmentSize: attachment.size,
+                    savedFileName,
                 },
                 "Upload completed successfully"
             );
-            await message.reply(`Added a sound to ${audioTargetLabel}.`);
+            await message.reply(`Added a sound to ${audioTargetLabel} as \`${savedFileName}\`.`);
             return;
         }
 
