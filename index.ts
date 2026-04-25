@@ -24,17 +24,19 @@ import {
     MAX_UPLOAD_SIZE_BYTES,
     deleteSlotAudio,
     getAudioPath,
+    listSlotAudio,
     saveAttachmentToSlot,
     type AudioSlotName,
 } from "./audioStorage";
 import { logger } from "./logger";
 
-type AudioCommand = "upload" | "delete";
+type AudioCommand = "upload" | "delete" | "list";
 
 type ParsedCommand = {
     command: AudioCommand;
     isDefaultScope: boolean;
     slotName: AudioSlotName;
+    args: string[];
 };
 
 const botLogger = logger.child({ module: "bot" });
@@ -74,18 +76,18 @@ const helpMessage = (): string =>
         "Commands:",
         `\`@Dihtator ping\` shows gateway, round-trip, and uptime stats.`,
         `\`@Dihtator help\` shows this message.`,
-        `\`@Dihtator upload join\` uploads your join sound from one attached audio file.`,
-        `\`@Dihtator upload leave\` uploads your leave sound from one attached audio file.`,
-        `\`@Dihtator upload join @user\` uploads a custom join sound for that user.`,
-        `\`@Dihtator upload leave @user\` uploads a custom leave sound for that user.`,
-        `\`@Dihtator upload default join\` uploads the default join fallback sound.`,
-        `\`@Dihtator upload default leave\` uploads the default leave fallback sound.`,
-        `\`@Dihtator delete join\` removes your current join sound.`,
-        `\`@Dihtator delete leave\` removes your current leave sound.`,
-        `\`@Dihtator delete join @user\` removes that user's custom join sound.`,
-        `\`@Dihtator delete leave @user\` removes that user's custom leave sound.`,
-        `\`@Dihtator delete default join\` removes the default join fallback sound.`,
-        `\`@Dihtator delete default leave\` removes the default leave fallback sound.`
+        `\`@Dihtator upload join\` adds one attached audio file to your join sound pool.`,
+        `\`@Dihtator upload leave\` adds one attached audio file to your leave sound pool.`,
+        `\`@Dihtator upload join @user\` adds one custom join sound for that user.`,
+        `\`@Dihtator upload leave @user\` adds one custom leave sound for that user.`,
+        `\`@Dihtator upload default join\` adds one default join fallback sound.`,
+        `\`@Dihtator upload default leave\` adds one default leave fallback sound.`,
+        `\`@Dihtator list join\` lists your current join sound files.`,
+        `\`@Dihtator list leave @user\` lists that user's custom leave sound files.`,
+        `\`@Dihtator list default join\` lists the default join fallback sound files.`,
+        `\`@Dihtator delete join join-1.mp3\` deletes one of your join sounds by file name.`,
+        `\`@Dihtator delete leave @user leave-2.wav\` deletes one custom sound by file name.`,
+        `\`@Dihtator delete default join join-3.ogg\` deletes one default fallback sound by file name.`
     ].join("\n");
 
 function formatDuration(durationMs: number): string {
@@ -124,7 +126,7 @@ function parseCommand(commandText: string): ParsedCommand | null {
     const parts = commandText.split(/\s+/).filter(Boolean);
     const [command, scopeOrSlot, slotMaybe] = parts;
 
-    if (command !== "upload" && command !== "delete") {
+    if (command !== "upload" && command !== "delete" && command !== "list") {
         return null;
     }
 
@@ -137,6 +139,7 @@ function parseCommand(commandText: string): ParsedCommand | null {
             command,
             isDefaultScope: true,
             slotName: slotMaybe,
+            args: parts.slice(3),
         };
     }
 
@@ -148,7 +151,12 @@ function parseCommand(commandText: string): ParsedCommand | null {
         command,
         isDefaultScope: false,
         slotName: scopeOrSlot,
+        args: parts.slice(2),
     };
+}
+
+function getNonMentionArgs(args: readonly string[]): string[] {
+    return args.filter((arg) => !/^<@!?\d+>$/.test(arg));
 }
 
 function getAudioTargetLabel(
@@ -472,7 +480,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    const { command, isDefaultScope, slotName } = parsedCommand;
+    const { command, isDefaultScope, slotName, args } = parsedCommand;
     const commandLogger = messageLogger.child({
         command,
         slotName,
@@ -493,6 +501,7 @@ client.on("messageCreate", async (message) => {
 
         const targetUser = isDefaultScope ? null : mentionedTargetUser ?? message.author;
         const targetUserId = targetUser?.id;
+        const nonMentionArgs = getNonMentionArgs(args);
         const audioTargetLabel = getAudioTargetLabel(
             slotName,
             targetUser,
@@ -507,6 +516,11 @@ client.on("messageCreate", async (message) => {
         targetLogger.info("Processing audio command");
 
         if (command === "upload") {
+            if (nonMentionArgs.length > 0) {
+                await message.reply("Upload commands do not take any extra arguments.");
+                return;
+            }
+
             const [attachment] = message.attachments.values();
             if (!attachment) {
                 targetLogger.warn("Upload command rejected because no attachment was provided");
@@ -522,19 +536,42 @@ client.on("messageCreate", async (message) => {
                 },
                 "Upload completed successfully"
             );
-            await message.reply(`Updated ${audioTargetLabel}.`);
+            await message.reply(`Added a sound to ${audioTargetLabel}.`);
             return;
         }
 
-        const removedCount = await deleteSlotAudio(slotName, targetUserId);
-        if (removedCount === 0) {
-            targetLogger.warn("Delete requested but no matching audio existed");
-            await message.reply(`There is no ${audioTargetLabel} to delete.`);
+        if (command === "list") {
+            if (nonMentionArgs.length > 0) {
+                await message.reply("List commands do not take any extra arguments.");
+                return;
+            }
+
+            const audioFiles = listSlotAudio(slotName, targetUserId);
+            if (audioFiles.length === 0) {
+                await message.reply(`There are no files in ${audioTargetLabel}.`);
+                return;
+            }
+
+            const fileLines = audioFiles.map((file) => `- ${file.fileName}`);
+            await message.reply([`Files in ${audioTargetLabel}:`, ...fileLines].join("\n"));
             return;
         }
 
-        targetLogger.info({ removedCount }, "Delete completed successfully");
-        await message.reply(`Deleted ${audioTargetLabel}.`);
+        if (nonMentionArgs.length !== 1) {
+            await message.reply("Delete commands require exactly one file name. Use the list command first.");
+            return;
+        }
+
+        const [fileName] = nonMentionArgs;
+        const deleted = await deleteSlotAudio(slotName, fileName, targetUserId);
+        if (!deleted) {
+            targetLogger.warn({ fileName }, "Delete requested but file was not found");
+            await message.reply(`Could not find \`${fileName}\` in ${audioTargetLabel}.`);
+            return;
+        }
+
+        targetLogger.info({ fileName }, "Delete completed successfully");
+        await message.reply(`Deleted \`${fileName}\` from ${audioTargetLabel}.`);
     } catch (error) {
         commandLogger.error(error, "Audio command failed");
         const errorMessage = error instanceof Error ? error.message : `${command} failed.`;

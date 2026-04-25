@@ -40,57 +40,146 @@ const MIME_EXTENSION_MAP: Record<string, string> = {
 };
 
 export const AUDIO_SLOTS = {
-    join: {
-        aliases: ["join", "picolo"],
-    },
-    leave: {
-        aliases: ["leave"],
-    },
+    join: ["join"],
+    leave: ["leave"],
 } as const;
 
 export type AudioSlotName = keyof typeof AUDIO_SLOTS;
+export type StoredAudioFile = {
+    fileName: string;
+    path: string;
+};
 
 function isSupportedExtension(extension: string): extension is SupportedExtension {
     return SUPPORTED_EXTENSIONS.has(extension as SupportedExtension);
 }
 
 export function getAudioPath(slotName: AudioSlotName, userId?: string): string | null {
-    const slot = AUDIO_SLOTS[slotName];
     const audioLookupLogger = storageLogger.child({ slotName, userId: userId ?? null });
 
     if (userId) {
-        const userAudioPath = findAudioFile(path.join(USER_AUDIO_DIR, userId), [slotName]);
-        if (userAudioPath) {
-            audioLookupLogger.debug({ audioPath: userAudioPath }, "Resolved user-specific audio path");
-            return userAudioPath;
+        const userAudioFiles = listAudioFilesForAliases(path.join(USER_AUDIO_DIR, userId), [slotName]);
+        const selectedUserAudioPath = pickRandomAudioPath(userAudioFiles.map((file) => file.path));
+        if (selectedUserAudioPath) {
+            audioLookupLogger.debug(
+                { audioPath: selectedUserAudioPath, candidateCount: userAudioFiles.length },
+                "Resolved random user-specific audio path"
+            );
+            return selectedUserAudioPath;
         }
     }
 
-    const fallbackAudioPath = findAudioFile(ASSETS_DIR, slot.aliases);
-    if (fallbackAudioPath) {
-        audioLookupLogger.debug({ audioPath: fallbackAudioPath }, "Resolved fallback audio path");
-        return fallbackAudioPath;
+    const fallbackAudioFiles = listAudioFilesForAliases(ASSETS_DIR, AUDIO_SLOTS[slotName]);
+    const selectedFallbackAudioPath = pickRandomAudioPath(fallbackAudioFiles.map((file) => file.path));
+    if (selectedFallbackAudioPath) {
+        audioLookupLogger.debug(
+            { audioPath: selectedFallbackAudioPath, candidateCount: fallbackAudioFiles.length },
+            "Resolved random fallback audio path"
+        );
+        return selectedFallbackAudioPath;
     }
 
     audioLookupLogger.warn("No audio path found for slot");
     return null;
 }
 
-function findAudioFile(baseDir: string, aliases: readonly string[]): string | null {
+export function listSlotAudio(slotName: AudioSlotName, userId?: string): StoredAudioFile[] {
+    const targetDir = userId ? path.join(USER_AUDIO_DIR, userId) : ASSETS_DIR;
+    const aliases = userId ? [slotName] : AUDIO_SLOTS[slotName];
+    return listAudioFilesForAliases(targetDir, aliases);
+}
+
+function listAudioFilesForAliases(baseDir: string, aliases: readonly string[]): StoredAudioFile[] {
     if (!fs.existsSync(baseDir)) {
+        return [];
+    }
+
+    return fs
+        .readdirSync(baseDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => createStoredAudioFile(baseDir, entry.name, aliases))
+        .filter((file): file is StoredAudioFile => file !== null)
+        .sort((left, right) => compareStoredAudioFiles(left.fileName, right.fileName, aliases));
+}
+
+function pickRandomAudioPath(audioPaths: readonly string[]): string | null {
+    if (audioPaths.length === 0) {
         return null;
     }
 
+    const index = Math.floor(Math.random() * audioPaths.length);
+    return audioPaths[index] ?? null;
+}
+
+function matchesSlotAlias(fileNameWithoutExtension: string, aliases: readonly string[]): boolean {
+    const normalizedName = fileNameWithoutExtension.toLowerCase();
+    return aliases.some(
+        (alias) =>
+            normalizedName === alias.toLowerCase() ||
+            normalizedName.startsWith(`${alias.toLowerCase()}-`)
+    );
+}
+
+function createStoredAudioFile(
+    baseDir: string,
+    fileName: string,
+    aliases: readonly string[]
+): StoredAudioFile | null {
+    const parsedPath = path.parse(fileName);
+    if (!isSupportedExtension(parsedPath.ext.toLowerCase())) {
+        return null;
+    }
+
+    if (!matchesSlotAlias(parsedPath.name, aliases)) {
+        return null;
+    }
+
+    return {
+        fileName,
+        path: path.join(baseDir, fileName),
+    };
+}
+
+function compareStoredAudioFiles(
+    leftFileName: string,
+    rightFileName: string,
+    aliases: readonly string[]
+): number {
+    const leftSequence = getFileSequence(leftFileName, aliases);
+    const rightSequence = getFileSequence(rightFileName, aliases);
+
+    if (leftSequence !== null && rightSequence !== null && leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+    }
+
+    if (leftSequence !== null && rightSequence === null) {
+        return -1;
+    }
+
+    if (leftSequence === null && rightSequence !== null) {
+        return 1;
+    }
+
+    return leftFileName.localeCompare(rightFileName);
+}
+
+function getFileSequence(fileName: string, aliases: readonly string[]): number | null {
+    const parsedPath = path.parse(fileName);
+    const normalizedName = parsedPath.name.toLowerCase();
+
     for (const alias of aliases) {
-        for (const extension of SUPPORTED_EXTENSIONS) {
-            const candidatePath = path.join(baseDir, `${alias}${extension}`);
-            if (fs.existsSync(candidatePath)) {
-                return candidatePath;
-            }
+        const normalizedAlias = alias.toLowerCase();
+        const match = normalizedName.match(new RegExp(`^${escapeRegExp(normalizedAlias)}-(\\d+)$`));
+        if (match) {
+            return Number.parseInt(match[1], 10);
         }
     }
 
     return null;
+}
+
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function getUploadExtension(attachment: Pick<Attachment, "name" | "url" | "contentType">): string | null {
@@ -111,8 +200,6 @@ export async function saveAttachmentToSlot(
     attachment: Attachment,
     userId?: string
 ): Promise<string> {
-    const slot = AUDIO_SLOTS[slotName];
-
     if (!attachment) {
         throw new Error("Attach one audio file to upload.");
     }
@@ -140,12 +227,14 @@ export async function saveAttachmentToSlot(
     }
 
     const targetDir = userId ? path.join(USER_AUDIO_DIR, userId) : ASSETS_DIR;
-    const aliases = userId ? [slotName] : slot.aliases;
+    const aliases = userId ? [slotName] : AUDIO_SLOTS[slotName];
 
     await fsp.mkdir(targetDir, { recursive: true });
 
-    const tempPath = path.join(targetDir, `${slotName}.upload${extension}`);
-    const targetPath = path.join(targetDir, `${slotName}${extension}`);
+    const nextSequence = getNextSequenceNumber(targetDir, aliases);
+    const targetFileName = `${slotName}-${nextSequence}${extension}`;
+    const tempPath = path.join(targetDir, `${slotName}-${nextSequence}.upload${extension}`);
+    const targetPath = path.join(targetDir, targetFileName);
 
     storageLogger.info(
         {
@@ -160,7 +249,6 @@ export async function saveAttachmentToSlot(
 
     try {
         await downloadFile(attachment.url, tempPath);
-        await removeSlotFiles(targetDir, aliases);
         await fsp.rename(tempPath, targetPath);
         storageLogger.info({ slotName, userId, targetPath }, "Saved uploaded audio successfully");
     } catch (error) {
@@ -172,52 +260,44 @@ export async function saveAttachmentToSlot(
     return targetPath;
 }
 
-export async function deleteSlotAudio(slotName: AudioSlotName, userId?: string): Promise<number> {
-    return deleteAudioForScope(slotName, userId);
-}
-
-async function deleteAudioForScope(slotName: AudioSlotName, userId?: string): Promise<number> {
-    const slot = AUDIO_SLOTS[slotName];
+export async function deleteSlotAudio(
+    slotName: AudioSlotName,
+    fileName: string,
+    userId?: string
+): Promise<boolean> {
     const targetDir = userId ? path.join(USER_AUDIO_DIR, userId) : ASSETS_DIR;
-    const aliases = userId ? [slotName] : slot.aliases;
+    const aliases = userId ? [slotName] : AUDIO_SLOTS[slotName];
+    const storedFiles = listAudioFilesForAliases(targetDir, aliases);
+    const targetFile = storedFiles.find((file) => file.fileName === fileName);
 
-    storageLogger.info({ slotName, userId, targetDir }, "Deleting audio for scope");
+    storageLogger.info({ slotName, userId, targetDir, fileName }, "Deleting audio file");
 
-    await fsp.mkdir(targetDir, { recursive: true });
-    const removedCount = await removeSlotFiles(targetDir, aliases);
+    if (!targetFile) {
+        return false;
+    }
 
-    if (userId) {
+    await fsp.rm(targetFile.path, { force: true });
+    storageLogger.debug({ targetDir, fileName }, "Removed audio file");
+
+    if (userId && fs.existsSync(targetDir)) {
         await removeDirIfEmpty(targetDir);
     }
 
-    storageLogger.info({ slotName, userId, removedCount }, "Finished deleting audio for scope");
-    return removedCount;
+    storageLogger.info({ slotName, userId, fileName }, "Finished deleting audio file");
+    return true;
 }
 
-async function removeSlotFiles(targetDir: string, aliases: readonly string[]): Promise<number> {
-    const entries = await fsp.readdir(targetDir, { withFileTypes: true });
-    let removedCount = 0;
+function getNextSequenceNumber(targetDir: string, aliases: readonly string[]): number {
+    const existingFiles = listAudioFilesForAliases(targetDir, aliases);
+    const sequences = existingFiles
+        .map((file) => getFileSequence(file.fileName, aliases))
+        .filter((sequence): sequence is number => sequence !== null);
 
-    for (const entry of entries) {
-        if (!entry.isFile()) {
-            continue;
-        }
-
-        const parsedPath = path.parse(entry.name);
-        if (!isSupportedExtension(parsedPath.ext.toLowerCase())) {
-            continue;
-        }
-
-        if (!aliases.includes(parsedPath.name.toLowerCase())) {
-            continue;
-        }
-
-        await fsp.rm(path.join(targetDir, entry.name), { force: true });
-        removedCount += 1;
-        storageLogger.debug({ targetDir, fileName: entry.name }, "Removed audio file");
+    if (sequences.length === 0) {
+        return 1;
     }
 
-    return removedCount;
+    return Math.max(...sequences) + 1;
 }
 
 async function removeDirIfEmpty(targetDir: string): Promise<void> {
