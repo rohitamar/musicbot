@@ -9,7 +9,9 @@ import {
     type VoiceBasedChannel,
 } from "discord.js";
 import {
+    type AudioPlayer,
     AudioPlayerStatus,
+    type VoiceConnection,
     VoiceConnectionStatus,
     createAudioPlayer,
     createAudioResource,
@@ -48,8 +50,24 @@ const client = new Client({
     ],
 });
 
-const PLAYBACK_DEBOUNCE_MS = 30_000;
-const recentlyPlayedGuilds = new Set<string>();
+type QueuedPlayback = {
+    audioPath: string;
+    slotName: AudioSlotName;
+    userId: string;
+    userTag: string;
+};
+
+type GuildVoiceSession = {
+    guildId: string;
+    channelId: string;
+    connection: VoiceConnection;
+    player: AudioPlayer;
+    queue: QueuedPlayback[];
+    isClosing: boolean;
+    logger: typeof botLogger;
+};
+
+const guildVoiceSessions = new Map<string, GuildVoiceSession>();
 
 const helpMessage = (): string =>
     [
@@ -150,12 +168,231 @@ function getAudioTargetLabel(
     return `${targetUser.username}'s ${slotName} audio`;
 }
 
-function getPlayableChannel(
-    joinedVoiceChannel: boolean,
-    oldChannel: VoiceBasedChannel | null,
-    newChannel: VoiceBasedChannel | null
+function hasHumanMembers(channel: VoiceBasedChannel): boolean {
+    return channel.members.some((guildMember) => !guildMember.user.bot);
+}
+
+function getCachedVoiceChannel(
+    guild: VoiceBasedChannel["guild"],
+    channelId: string
 ): VoiceBasedChannel | null {
-    return joinedVoiceChannel ? newChannel : oldChannel;
+    const cachedChannel = guild.channels.cache.get(channelId);
+    return cachedChannel?.isVoiceBased() ? cachedChannel : null;
+}
+
+function getMissingVoicePermissions(channel: VoiceBasedChannel): string[] {
+    const botMember = channel.guild.members.me;
+    if (!botMember) {
+        return ["GuildMemberUnavailable"];
+    }
+
+    const permissions = channel.permissionsFor(botMember);
+    const requiredPermissions = [
+        { name: "ViewChannel", value: PermissionFlagsBits.ViewChannel },
+        { name: "Connect", value: PermissionFlagsBits.Connect },
+        { name: "Speak", value: PermissionFlagsBits.Speak },
+    ] as const;
+
+    return requiredPermissions
+        .filter(({ value }) => !permissions?.has(value))
+        .map(({ name }) => name);
+}
+
+function destroyVoiceSession(guildId: string, reason: string): void {
+    const session = guildVoiceSessions.get(guildId);
+    if (!session) {
+        return;
+    }
+
+    session.logger.info({ reason }, "Leaving voice channel");
+    session.isClosing = true;
+    session.queue = [];
+    session.player.stop(true);
+    if (session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        session.connection.destroy();
+    }
+    guildVoiceSessions.delete(guildId);
+}
+
+function drainAudioQueue(session: GuildVoiceSession): void {
+    if (session.isClosing || session.player.state.status !== AudioPlayerStatus.Idle) {
+        return;
+    }
+
+    const nextPlayback = session.queue.shift();
+    if (!nextPlayback) {
+        return;
+    }
+
+    const playbackLogger = session.logger.child({
+        slotName: nextPlayback.slotName,
+        userId: nextPlayback.userId,
+        userTag: nextPlayback.userTag,
+        audioPath: nextPlayback.audioPath,
+    });
+
+    const resource = createAudioResource(nextPlayback.audioPath, {
+        inlineVolume: true,
+    });
+    resource.volume?.setVolume(0.4);
+
+    playbackLogger.info({ volume: 0.4 }, "Starting audio playback");
+    session.player.play(resource);
+}
+
+function enqueueAudioPlayback(session: GuildVoiceSession, playback: QueuedPlayback): void {
+    session.queue.push(playback);
+    session.logger.debug(
+        {
+            queueLength: session.queue.length,
+            slotName: playback.slotName,
+            userId: playback.userId,
+        },
+        "Queued audio playback"
+    );
+    drainAudioQueue(session);
+}
+
+async function getOrCreateVoiceSession(
+    channel: VoiceBasedChannel,
+    voiceLogger: typeof botLogger
+): Promise<GuildVoiceSession | null> {
+    const guildId = channel.guild.id;
+    const existingSession = guildVoiceSessions.get(guildId);
+
+    if (existingSession) {
+        if (existingSession.channelId === channel.id) {
+            return existingSession;
+        }
+
+        const existingChannel = getCachedVoiceChannel(channel.guild, existingSession.channelId);
+        if (existingChannel && hasHumanMembers(existingChannel)) {
+            voiceLogger.info(
+                {
+                    requestedChannelId: channel.id,
+                    connectedChannelId: existingSession.channelId,
+                },
+                "Skipped joining another voice channel while current channel still has listeners"
+            );
+            return null;
+        }
+
+        destroyVoiceSession(guildId, "connected channel is empty before switching channels");
+    }
+
+    const missingPermissions = getMissingVoicePermissions(channel);
+    if (missingPermissions.length > 0) {
+        voiceLogger.warn(
+            {
+                channelId: channel.id,
+                missingPermissions,
+            },
+            "Missing voice permissions"
+        );
+        return null;
+    }
+
+    const sessionLogger = botLogger.child({
+        module: "voiceSession",
+        guildId,
+        channelId: channel.id,
+    });
+
+    sessionLogger.info("Joining voice channel");
+    const connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId,
+        adapterCreator: channel.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false,
+    });
+    const player = createAudioPlayer();
+    const session: GuildVoiceSession = {
+        guildId,
+        channelId: channel.id,
+        connection,
+        player,
+        queue: [],
+        isClosing: false,
+        logger: sessionLogger,
+    };
+
+    player.on("error", (error) => {
+        sessionLogger.error(error, "Audio player error");
+        drainAudioQueue(session);
+    });
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        sessionLogger.debug({ queueLength: session.queue.length }, "Audio player is idle");
+        drainAudioQueue(session);
+    });
+
+    connection.on(VoiceConnectionStatus.Destroyed, () => {
+        sessionLogger.info("Voice connection destroyed");
+        guildVoiceSessions.delete(guildId);
+    });
+
+    const subscribed = connection.subscribe(player);
+    if (!subscribed) {
+        sessionLogger.warn("Voice connection did not accept player subscription");
+    }
+
+    guildVoiceSessions.set(guildId, session);
+
+    try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 5_000);
+        sessionLogger.info("Voice connection is ready");
+    } catch (error) {
+        sessionLogger.error(error, "Voice connection never became ready");
+        guildVoiceSessions.delete(guildId);
+        if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            connection.destroy();
+        }
+        return null;
+    }
+
+    return session;
+}
+
+async function enqueueVoiceEventAudio(
+    slotName: AudioSlotName,
+    channel: VoiceBasedChannel,
+    userId: string,
+    userTag: string,
+    voiceLogger: typeof botLogger,
+    shouldCreateSession: boolean
+): Promise<void> {
+    const audioPath = getAudioPath(slotName, userId);
+    const playbackLogger = voiceLogger.child({
+        slotName,
+        channelId: channel.id,
+    });
+
+    if (!audioPath) {
+        playbackLogger.warn("Audio path not found");
+        return;
+    }
+
+    let session: GuildVoiceSession | null | undefined = guildVoiceSessions.get(channel.guild.id);
+    if (!session || session.channelId !== channel.id) {
+        if (!shouldCreateSession) {
+            playbackLogger.debug("Skipped playback because bot is not connected to this channel");
+            return;
+        }
+
+        session = await getOrCreateVoiceSession(channel, playbackLogger);
+    }
+
+    if (!session) {
+        return;
+    }
+
+    enqueueAudioPlayback(session, {
+        audioPath,
+        slotName,
+        userId,
+        userTag,
+    });
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -319,10 +556,11 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         return;
     }
 
-    const joinedVoiceChannel = oldState.channelId === null && newState.channelId !== null;
-    const leftVoiceChannel = oldState.channelId !== null && newState.channelId === null;
+    const changedVoiceChannel = oldState.channelId !== newState.channelId;
+    const joinedVoiceChannel = changedVoiceChannel && newState.channelId !== null;
+    const leftVoiceChannel = changedVoiceChannel && oldState.channelId !== null;
 
-    if (!joinedVoiceChannel && !leftVoiceChannel) {
+    if (!changedVoiceChannel) {
         return;
     }
 
@@ -343,121 +581,34 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         "Voice state update received"
     );
 
-    const key = member.guild.id;
-    if (recentlyPlayedGuilds.has(key)) {
-        voiceLogger.debug("Skipped playback because guild is cooling down");
-        return;
-    }
-
-    recentlyPlayedGuilds.add(key);
-    setTimeout(() => {
-        recentlyPlayedGuilds.delete(key);
-        voiceLogger.debug({ cooldownMs: PLAYBACK_DEBOUNCE_MS }, "Guild playback cooldown expired");
-    }, PLAYBACK_DEBOUNCE_MS);
-
-    const channel = getPlayableChannel(joinedVoiceChannel, oldState.channel, newState.channel);
-    if (!channel) {
-        voiceLogger.warn("Playable voice channel could not be determined");
-        return;
-    }
-
-    if (leftVoiceChannel) {
-        const hasHumanListeners = channel.members.some((guildMember) => !guildMember.user.bot);
-        if (!hasHumanListeners) {
-            voiceLogger.info(
-                { channelId: channel.id },
-                "Skipped leave sound because no human listeners remain"
-            );
-            return;
+    if (leftVoiceChannel && oldState.channel) {
+        const session = guildVoiceSessions.get(member.guild.id);
+        if (session?.channelId === oldState.channel.id) {
+            if (!hasHumanMembers(oldState.channel)) {
+                destroyVoiceSession(member.guild.id, "all humans left the connected voice channel");
+            } else {
+                await enqueueVoiceEventAudio(
+                    "leave",
+                    oldState.channel,
+                    member.id,
+                    member.user.tag,
+                    voiceLogger,
+                    false
+                );
+            }
         }
     }
 
-    const slotName: AudioSlotName = joinedVoiceChannel ? "join" : "leave";
-    const audioPath = getAudioPath(slotName, member.id);
-    const playbackLogger = voiceLogger.child({
-        slotName,
-        channelId: channel.id,
-    });
-
-    if (!audioPath) {
-        playbackLogger.warn("Audio path not found");
-        return;
-    }
-
-    const botMember = channel.guild.members.me;
-    if (!botMember) {
-        playbackLogger.error("Bot member is not available in guild");
-        return;
-    }
-
-    const permissions = channel.permissionsFor(botMember);
-    const requiredPermissions = [
-        { name: "ViewChannel", value: PermissionFlagsBits.ViewChannel },
-        { name: "Connect", value: PermissionFlagsBits.Connect },
-        { name: "Speak", value: PermissionFlagsBits.Speak },
-    ] as const;
-    const missingPermissions = requiredPermissions
-        .filter(({ value }) => !permissions?.has(value))
-        .map(({ name }) => name);
-
-    if (missingPermissions.length > 0) {
-        playbackLogger.warn(
-            {
-                missingPermissions,
-            },
-            "Missing voice permissions"
+    if (joinedVoiceChannel && newState.channel) {
+        await enqueueVoiceEventAudio(
+            "join",
+            newState.channel,
+            member.id,
+            member.user.tag,
+            voiceLogger,
+            true
         );
-        return;
     }
-
-    playbackLogger.info(
-        {
-            audioPath,
-        },
-        "Joining voice channel for playback"
-    );
-
-    const connection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-        selfDeaf: false,
-        selfMute: false,
-    });
-
-    try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 5_000);
-        playbackLogger.info("Voice connection is ready");
-    } catch (error) {
-        playbackLogger.error(error, "Voice connection never became ready");
-        connection.destroy();
-        return;
-    }
-
-    const player = createAudioPlayer();
-
-    player.on("error", (error) => {
-        playbackLogger.error(error, "Audio player error");
-        connection.destroy();
-    });
-
-    const resource = createAudioResource(audioPath, {
-        inlineVolume: true,
-    });
-    resource.volume?.setVolume(0.4);
-
-    const subscribed = connection.subscribe(player);
-    if (!subscribed) {
-        playbackLogger.warn("Voice connection did not accept player subscription");
-    }
-
-    playbackLogger.info({ volume: 0.4 }, "Starting audio playback");
-    player.play(resource);
-
-    player.on(AudioPlayerStatus.Idle, () => {
-        playbackLogger.info("Playback finished; leaving VC");
-        connection.destroy();
-    });
 });
 
 const discordToken = process.env.DISCORD_TOKEN;
