@@ -51,9 +51,10 @@ const client = new Client({
 const PLAYBACK_DEBOUNCE_MS = 30_000;
 const recentlyPlayedGuilds = new Set<string>();
 
-const helpMessage = (botUserId: string): string =>
+const helpMessage = (): string =>
     [
         "Commands:",
+        `\`@Dihtator ping\` shows gateway, round-trip, and uptime stats.`,
         `\`@Dihtator help\` shows this message.`,
         `\`@Dihtator upload join\` uploads your join sound from one attached audio file.`,
         `\`@Dihtator upload leave\` uploads your leave sound from one attached audio file.`,
@@ -68,6 +69,23 @@ const helpMessage = (botUserId: string): string =>
         `\`@Dihtator delete default join\` removes the default join fallback sound.`,
         `\`@Dihtator delete default leave\` removes the default leave fallback sound.`
     ].join("\n");
+
+function formatDuration(durationMs: number): string {
+    const totalSeconds = Math.floor(durationMs / 1000);
+    const days = Math.floor(totalSeconds / 86_400);
+    const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+    const minutes = Math.floor((totalSeconds % 3_600) / 60);
+    const seconds = totalSeconds % 60;
+
+    const parts = [
+        days > 0 ? `${days}d` : null,
+        hours > 0 || days > 0 ? `${hours}h` : null,
+        minutes > 0 || hours > 0 || days > 0 ? `${minutes}m` : null,
+        `${seconds}s`,
+    ].filter(Boolean);
+
+    return parts.join(" ");
+}
 
 function getMentionedTargetUser(message: Message, botUserId: string): User | null {
     const targetUsers = message.mentions.users.filter((user) => user.id !== botUserId);
@@ -173,14 +191,47 @@ client.on("messageCreate", async (message) => {
 
     if (!commandText || commandText === "help" || commandText === "commands") {
         messageLogger.info("Sending help message");
-        await message.reply(helpMessage(client.user.id));
+        await message.reply(helpMessage());
+        return;
+    }
+
+    if (commandText === "ping") {
+        const pingStartedAt = Date.now();
+        const pingLogger = messageLogger.child({ command: "ping" });
+
+        pingLogger.info("Processing ping command");
+        const reply = await message.reply("Pinging...");
+        const roundTripMs = Date.now() - pingStartedAt;
+        const messageLatencyMs = reply.createdTimestamp - message.createdTimestamp;
+        const gatewayPingMs = client.ws.ping;
+        const uptime = client.uptime ? formatDuration(client.uptime) : "unknown";
+
+        await reply.edit(
+            [
+                "Pong.",
+                `Gateway: ${gatewayPingMs}ms`,
+                `Round-trip: ${roundTripMs}ms`,
+                `Message latency: ${messageLatencyMs}ms`,
+                `Uptime: ${uptime}`,
+            ].join("\n")
+        );
+
+        pingLogger.info(
+            {
+                gatewayPingMs,
+                roundTripMs,
+                messageLatencyMs,
+                uptimeMs: client.uptime ?? null,
+            },
+            "Ping command completed"
+        );
         return;
     }
 
     const parsedCommand = parseCommand(commandText);
     if (!parsedCommand) {
         messageLogger.warn({ commandText }, "Invalid command; sending help message");
-        await message.reply(helpMessage(client.user.id));
+        await message.reply(helpMessage());
         return;
     }
 
