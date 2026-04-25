@@ -1,5 +1,8 @@
 import "dotenv/config";
 
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
+
 import {
     Client,
     GatewayIntentBits,
@@ -11,6 +14,7 @@ import {
 import {
     type AudioPlayer,
     AudioPlayerStatus,
+    StreamType,
     type VoiceConnection,
     VoiceConnectionStatus,
     createAudioPlayer,
@@ -28,6 +32,7 @@ import {
     saveAttachmentToSlot,
     type AudioSlotName,
 } from "./audioStorage";
+import ffmpegStatic from "ffmpeg-static";
 import { logger } from "./logger";
 
 type AudioCommand = "upload" | "delete" | "list";
@@ -65,11 +70,21 @@ type GuildVoiceSession = {
     connection: VoiceConnection;
     player: AudioPlayer;
     queue: QueuedPlayback[];
+    currentTranscoder: ChildProcessByStdio<null, Readable, Readable> | null;
     isClosing: boolean;
     logger: typeof botLogger;
 };
 
 const guildVoiceSessions = new Map<string, GuildVoiceSession>();
+const MAX_AUDIO_PLAYBACK_SECONDS = 5;
+const USER_AUDIO_RATE_LIMIT_MS = 60_000;
+const recentUserAudioPlaybackAt = new Map<string, number>();
+
+if (!ffmpegStatic) {
+    throw new Error("ffmpeg-static did not provide an ffmpeg binary path.");
+}
+
+const FFMPEG_PATH: string = ffmpegStatic;
 
 const helpMessage = (): string =>
     [
@@ -206,6 +221,10 @@ function getMissingVoicePermissions(channel: VoiceBasedChannel): string[] {
         .map(({ name }) => name);
 }
 
+function getUserPlaybackRateLimitKey(guildId: string, userId: string): string {
+    return `${guildId}:${userId}`;
+}
+
 function destroyVoiceSession(guildId: string, reason: string): void {
     const session = guildVoiceSessions.get(guildId);
     if (!session) {
@@ -215,11 +234,24 @@ function destroyVoiceSession(guildId: string, reason: string): void {
     session.logger.info({ reason }, "Leaving voice channel");
     session.isClosing = true;
     session.queue = [];
+    cleanupCurrentTranscoder(session);
     session.player.stop(true);
     if (session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         session.connection.destroy();
     }
     guildVoiceSessions.delete(guildId);
+}
+
+function cleanupCurrentTranscoder(session: GuildVoiceSession): void {
+    const transcoder = session.currentTranscoder;
+    if (!transcoder) {
+        return;
+    }
+
+    session.currentTranscoder = null;
+    if (!transcoder.killed) {
+        transcoder.kill("SIGKILL");
+    }
 }
 
 function drainAudioQueue(session: GuildVoiceSession): void {
@@ -239,12 +271,61 @@ function drainAudioQueue(session: GuildVoiceSession): void {
         audioPath: nextPlayback.audioPath,
     });
 
-    const resource = createAudioResource(nextPlayback.audioPath, {
+    const transcoder = spawn(
+        FFMPEG_PATH,
+        [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            nextPlayback.audioPath,
+            "-t",
+            `${MAX_AUDIO_PLAYBACK_SECONDS}`,
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "pipe:1",
+        ],
+        {
+            stdio: ["ignore", "pipe", "pipe"],
+        }
+    );
+
+    session.currentTranscoder = transcoder;
+
+    transcoder.once("error", (error: Error) => {
+        playbackLogger.error(error, "ffmpeg failed to start");
+        if (session.currentTranscoder === transcoder) {
+            session.currentTranscoder = null;
+        }
+        session.player.stop(true);
+    });
+
+    transcoder.stderr.on("data", (chunk: Buffer) => {
+        const message = chunk.toString().trim();
+        if (message) {
+            playbackLogger.warn({ ffmpegMessage: message }, "ffmpeg stderr");
+        }
+    });
+
+    transcoder.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
+        if (session.currentTranscoder === transcoder) {
+            session.currentTranscoder = null;
+        }
+
+        playbackLogger.debug({ code, signal }, "ffmpeg transcoder exited");
+    });
+
+    const resource = createAudioResource(transcoder.stdout, {
         inlineVolume: true,
+        inputType: StreamType.Raw,
     });
     resource.volume?.setVolume(0.4);
 
-    playbackLogger.info({ volume: 0.4 }, "Starting audio playback");
+    playbackLogger.info({ volume: 0.4, maxSeconds: MAX_AUDIO_PLAYBACK_SECONDS }, "Starting audio playback");
     session.player.play(resource);
 }
 
@@ -321,22 +402,26 @@ async function getOrCreateVoiceSession(
         connection,
         player,
         queue: [],
+        currentTranscoder: null,
         isClosing: false,
         logger: sessionLogger,
     };
 
     player.on("error", (error) => {
         sessionLogger.error(error, "Audio player error");
+        cleanupCurrentTranscoder(session);
         drainAudioQueue(session);
     });
 
     player.on(AudioPlayerStatus.Idle, () => {
         sessionLogger.debug({ queueLength: session.queue.length }, "Audio player is idle");
+        cleanupCurrentTranscoder(session);
         drainAudioQueue(session);
     });
 
     connection.on(VoiceConnectionStatus.Destroyed, () => {
         sessionLogger.info("Voice connection destroyed");
+        cleanupCurrentTranscoder(session);
         guildVoiceSessions.delete(guildId);
     });
 
@@ -352,6 +437,7 @@ async function getOrCreateVoiceSession(
         sessionLogger.info("Voice connection is ready");
     } catch (error) {
         sessionLogger.error(error, "Voice connection never became ready");
+        cleanupCurrentTranscoder(session);
         guildVoiceSessions.delete(guildId);
         if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
             connection.destroy();
@@ -370,11 +456,25 @@ async function enqueueVoiceEventAudio(
     voiceLogger: typeof botLogger,
     shouldCreateSession: boolean
 ): Promise<void> {
+    const rateLimitKey = getUserPlaybackRateLimitKey(channel.guild.id, userId);
+    const lastPlaybackAt = recentUserAudioPlaybackAt.get(rateLimitKey);
+    const now = Date.now();
     const audioPath = getAudioPath(slotName, userId);
     const playbackLogger = voiceLogger.child({
         slotName,
         channelId: channel.id,
     });
+
+    if (typeof lastPlaybackAt === "number" && now - lastPlaybackAt < USER_AUDIO_RATE_LIMIT_MS) {
+        playbackLogger.info(
+            {
+                rateLimitMs: USER_AUDIO_RATE_LIMIT_MS,
+                remainingMs: USER_AUDIO_RATE_LIMIT_MS - (now - lastPlaybackAt),
+            },
+            "Skipped audio playback because user is rate limited"
+        );
+        return;
+    }
 
     if (!audioPath) {
         playbackLogger.warn("Audio path not found");
@@ -401,6 +501,7 @@ async function enqueueVoiceEventAudio(
         userId,
         userTag,
     });
+    recentUserAudioPlaybackAt.set(rateLimitKey, now);
 }
 
 process.on("unhandledRejection", (reason) => {
